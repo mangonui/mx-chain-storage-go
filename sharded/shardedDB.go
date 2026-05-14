@@ -75,16 +75,23 @@ func (s *shardedPersister) Has(key []byte) error {
 	return s.persisters[s.computeID(key)].Has(key)
 }
 
-// Close closes the files/resources associated to the persistence medium
+// Close closes the files/resources associated to the persistence medium.
+//
+// ISSUE-058: previously this returned on the first shard error, leaving
+// every later shard's resources (file descriptors, write batches,
+// background goroutines) un-released. On a long-running node that
+// happens to have a bad shard, every Close() leaked the healthy
+// shards. Now: attempt every shard, join the errors. Caller sees
+// every failure rather than just the first.
 func (s *shardedPersister) Close() error {
+	var errs []error
 	for _, persister := range s.persisters {
-		err := persister.Close()
-		if err != nil {
-			return err
+		if err := persister.Close(); err != nil {
+			errs = append(errs, err)
 		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // Remove removes the data associated to the given key
@@ -92,28 +99,37 @@ func (s *shardedPersister) Remove(key []byte) error {
 	return s.persisters[s.computeID(key)].Remove(key)
 }
 
-// Destroy removes the persistence medium stored data
+// Destroy removes the persistence medium stored data.
+//
+// ISSUE-058: same continue-on-error fix as Close above — destroy every
+// shard regardless of intermediate failures, return the joined error
+// set. Partial-destroy state across a sharded store is hostile to
+// recovery, so we prefer "destroyed as much as we could + reported all
+// failures" to "stopped at the first failure + left N-i shards
+// untouched".
 func (s *shardedPersister) Destroy() error {
+	var errs []error
 	for _, persister := range s.persisters {
-		err := persister.Destroy()
-		if err != nil {
-			return err
+		if err := persister.Destroy(); err != nil {
+			errs = append(errs, err)
 		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
-// DestroyClosed removes the already closed persistence medium stored data
+// DestroyClosed removes the already closed persistence medium stored data.
+//
+// ISSUE-058: continue-on-error mirror of Destroy.
 func (s *shardedPersister) DestroyClosed() error {
+	var errs []error
 	for _, persister := range s.persisters {
-		err := persister.DestroyClosed()
-		if err != nil {
-			return err
+		if err := persister.DestroyClosed(); err != nil {
+			errs = append(errs, err)
 		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // RangeKeys will iterate over all contained pairs, in all persisters, calling te provided handler

@@ -2,6 +2,7 @@ package leveldb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -321,16 +322,32 @@ func (s *SerialDB) DestroyClosed() error {
 // doClose will handle the closing of the internal components
 // must be called under mutex protection
 // TODO: re-use this function in leveldb.go as well
+//
+// ISSUE-059: previously the final batch flush error was silently
+// discarded (`_ = s.putBatch()`). Now: capture flushErr and join with
+// the db.Close() error so the caller sees both failure modes.
+//
+// Idempotence: a second Close must remain a no-op (return nil) per
+// the TestSerialDB_CloseTwice contract. We use `isClosed()` to detect
+// the second-call case BEFORE attempting putBatch — calling putBatch
+// after the first close routes through a closed channel and returns
+// a meaningless "DB closed" error that callers shouldn't see.
 func (s *SerialDB) doClose() error {
-	_ = s.putBatch()
+	if s.isClosed() {
+		// Second-or-later close. Nothing to flush, nothing to teardown.
+		return nil
+	}
+
+	flushErr := s.putBatch()
 	s.cancel()
 
 	db := s.makeDbPointerNilReturningLast()
+	var closeErr error
 	if db != nil {
-		return db.Close()
+		closeErr = db.Close()
 	}
 
-	return nil
+	return errors.Join(flushErr, closeErr)
 }
 
 func (s *SerialDB) processLoop(ctx context.Context) {

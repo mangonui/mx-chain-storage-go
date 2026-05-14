@@ -2,6 +2,7 @@ package txcache
 
 import (
 	"bytes"
+	"math"
 	"math/big"
 
 	"github.com/multiversx/mx-chain-core-go/data"
@@ -28,12 +29,35 @@ type WrappedTransaction struct {
 }
 
 // precomputeFields computes (and caches) the (average) price per gas unit.
+//
+// ISSUE-057: previously this computed `wrappedTx.Fee.Uint64() / gasLimit`
+// directly. `big.Int.Uint64()` silently truncates to the low 64 bits if
+// the value exceeds `math.MaxUint64`, so a fee above 2^64 wei (chain-
+// dependent but not impossible on chains with very high precision or
+// adversarially-crafted fee fields) would wrap around — producing a
+// PricePerUnit of 0 (or some tiny modular remainder), giving the tx the
+// LOWEST priority in the mempool instead of the highest. That's
+// mempool-priority manipulation by overflow.
+//
+// Now the division happens in big.Int math, and the result is clamped
+// at MaxUint64 before narrowing. Overflowing fees end up with the
+// highest possible priority (the intent of high-fee txs) rather than
+// wrapping to zero.
 func (wrappedTx *WrappedTransaction) precomputeFields(host MempoolHost) {
 	wrappedTx.Fee = host.ComputeTxFee(wrappedTx.Tx)
 
 	gasLimit := wrappedTx.Tx.GetGasLimit()
 	if gasLimit != 0 {
-		wrappedTx.PricePerUnit = wrappedTx.Fee.Uint64() / gasLimit
+		gasLimitBig := new(big.Int).SetUint64(gasLimit)
+		pricePerUnit := new(big.Int).Quo(wrappedTx.Fee, gasLimitBig)
+		if pricePerUnit.IsUint64() {
+			wrappedTx.PricePerUnit = pricePerUnit.Uint64()
+		} else {
+			// Fee per unit exceeds MaxUint64 — clamp to the maximum
+			// so the tx wins priority comparisons (the intent of a
+			// very-high-fee tx) rather than wrapping to a small value.
+			wrappedTx.PricePerUnit = math.MaxUint64
+		}
 	}
 
 	wrappedTx.TransferredValue = host.GetTransferredValue(wrappedTx.Tx)

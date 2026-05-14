@@ -89,6 +89,12 @@ func (u *Unit) RangeKeys(handler func(key []byte, value []byte) bool) {
 // Get searches the key in the cache. In case it is not found,
 // it further searches it in the associated database.
 // In case it is found in the database, the cache is updated with the value as well.
+//
+// ISSUE-055: previously the cache-hit path returned `v.([]byte)` with a
+// bare (unchecked) type assertion, while the cache-miss path checked
+// the assertion explicitly. A poisoned cache or a test mock returning
+// non-bytes would panic on the cache-hit return. Asymmetric defensive
+// coding is a thinko; bring both paths to the same posture.
 func (u *Unit) Get(key []byte) ([]byte, error) {
 	u.lock.Lock()
 	defer u.lock.Unlock()
@@ -114,7 +120,14 @@ func (u *Unit) Get(key []byte) ([]byte, error) {
 		u.cacher.Put(key, v, len(buff))
 	}
 
-	return v.([]byte), nil
+	// ISSUE-055: cache-hit path. Mirror the cache-miss assertion so a
+	// poisoned cache returns an error rather than panicking.
+	buff, okAssertion := v.([]byte)
+	if !okAssertion {
+		return nil, fmt.Errorf("cache value for key: %s is not a byte slice",
+			base64.StdEncoding.EncodeToString(key))
+	}
+	return buff, nil
 }
 
 // GetFromEpoch will call the Get method as this storer doesn't handle epochs

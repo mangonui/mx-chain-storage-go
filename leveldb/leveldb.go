@@ -2,6 +2,7 @@ package leveldb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -242,20 +243,28 @@ func (s *DB) putBatch(b types.Batcher) error {
 	return db.Write(dbBatch.batch, wopt)
 }
 
-// Close closes the files/resources associated to the storage medium
+// Close closes the files/resources associated to the storage medium.
+//
+// ISSUE-056: previously the final batch flush error was silently
+// discarded (`_ = s.putBatch(s.batch)`), so a Close on a DB whose last
+// batch failed to persist would report success to the caller. Now the
+// flush error is captured and joined with the db.Close() error; the
+// caller sees both. errors.Join handles the all-nil case cleanly
+// (returns nil), so the success path is unchanged.
 func (s *DB) Close() error {
 	s.mutBatch.Lock()
-	_ = s.putBatch(s.batch)
+	flushErr := s.putBatch(s.batch)
 	s.sizeBatch = 0
 	s.mutBatch.Unlock()
 
 	s.cancel()
 	db := s.makeDbPointerNilReturningLast()
+	var closeErr error
 	if db != nil {
-		return db.Close()
+		closeErr = db.Close()
 	}
 
-	return nil
+	return errors.Join(flushErr, closeErr)
 }
 
 // Remove removes the data associated to the given key
